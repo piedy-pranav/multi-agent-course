@@ -50,3 +50,14 @@ modules/Module_3_Production_Agentic_RAG_AI_Systems/updated-code/
 modules/Module_3_Production_Agentic_RAG_AI_Systems/cache.json
 modules/Module_3_Production_Agentic_RAG_AI_Systems/rag_cache.json
 modules/Module_3_Production_Agentic_RAG_AI_Systems/**/qdrant_data/.lock
+
+# Archive snapshots of an assignment folder. SEC-004: a zip of a project directory carries
+# whatever was in it, including .env / atlas-credentials.env, and the assignment's own
+# .gitignore cannot see a file that sits beside the directory rather than inside it.
+# No archive is tracked anywhere in this repo, so ignoring the family is safe.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar

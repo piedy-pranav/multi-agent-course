@@ -4,6 +4,9 @@ web/dist/
 .env
 .env.*
 !.env.example
+# Atlas onboarding writes credentials to a file whose name does not start with ".env",
+# so the patterns above miss it.
+*credentials*.env
 runs/
 reports/
 *.log

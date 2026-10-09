@@ -20,8 +20,19 @@ import { pinoHttp } from 'pino-http';
 import pino from 'pino';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER } from '@lumina/contract';
+import {
+  AskBody,
+  CreateSpaceBody,
+  CreateThreadBody,
+  HealthResponse,
+  REQUEST_HEADER,
+  ROUTES,
+  USER_HEADER
+} from '@lumina/contract';
 import { env } from './env.js';
+import { proxyToAgent, proxyAskStream, proxyUpload } from './proxy.js';
+import { validateBody } from './validate.js';
+import { rateLimit } from './rateLimit.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -29,10 +40,23 @@ const app = express();
 app.disable('x-powered-by');
 app.use(cors({ origin: env.corsOrigins, credentials: false, exposedHeaders: [REQUEST_HEADER] }));
 
-// One request id, reused if the caller sent one, generated if not, forwarded to the agent
-// service and logged by both. This is what makes one request greppable end to end.
+/**
+ * D3 (Component 6): adopt the inbound `X-Request-Id` only if it is acceptable. This id
+ * becomes a filename on the agent side (`runs/<id>.json`), and the contract's `RequestId`
+ * is only `z.string().min(1)` — a header of `../../etc/foo` would be a path traversal the
+ * contract does nothing to stop. An unacceptable id is never a `400`: a caller may not
+ * control that header (a corporate proxy, a platform's own router), so it is logged once
+ * and silently replaced — correlation stays exact because nothing downstream ever sees
+ * the rejected value.
+ */
+const REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
 app.use((req, res, next) => {
-  const id = (req.header(REQUEST_HEADER) ?? `req_${randomUUID().slice(0, 12)}`).trim();
+  const inbound = req.header(REQUEST_HEADER);
+  const id = inbound && REQUEST_ID_RE.test(inbound) ? inbound : `req_${randomUUID().slice(0, 12)}`;
+  if (inbound && id !== inbound) {
+    log.warn({ rejected: inbound }, 'rejected unacceptable inbound X-Request-Id; generated a fresh one');
+  }
   res.locals.requestId = id;
   res.setHeader(REQUEST_HEADER, id);
   next();
@@ -50,6 +74,29 @@ app.use(
     autoLogging: true
   })
 );
+
+/**
+ * D2/Component 6: auth BEFORE body parsing, so the two 4xx cases are unambiguous —
+ * missing `X-User-Id` is always `401`, regardless of whether the body is valid JSON;
+ * malformed JSON with a valid `X-User-Id` is `400` (BUG-007, below), never `502`.
+ * `/health` and `GET /evals/report.json` are the only routes with no `X-User-Id`
+ * requirement (`ROUTES[].auth`).
+ */
+const AUTH_EXEMPT_PATHS = new Set<string>(ROUTES.filter((r) => !r.auth).map((r) => r.path));
+
+app.use((req, res, next) => {
+  if (AUTH_EXEMPT_PATHS.has(req.path)) return next();
+  const userId = req.header(USER_HEADER);
+  if (!userId) {
+    res.status(401).json({ error: `missing ${USER_HEADER} header`, status: 401, requestId: String(res.locals.requestId) });
+    return;
+  }
+  next();
+});
+
+// Component 8: a per-user rate limit, BEFORE body parsing, so an abusive client's
+// malformed bodies still consume quota.
+app.use(rateLimit());
 
 // JSON everywhere except the multipart upload route, which your handler owns.
 app.use((req, res, next) =>
@@ -82,6 +129,31 @@ app.get('/health', async (_req, res) => {
   res.status(ai.status === 'ok' ? 200 : 503).json(body);
 });
 
+// ---------------------------------------------------------------- proxy to the agent (implemented)
+
+/**
+ * D1: replace the 501 loop only for routes the agent actually implements. Everything else
+ * stays 501 from both services this phase (RAG, memory, spaces, deep search — later
+ * phases). `/threads/:threadId/ask` gets the Component 7 streaming forwarder — the one
+ * deliberate exception to the generic (buffered) `proxyToAgent`.
+ */
+app.post('/threads', validateBody(CreateThreadBody), proxyToAgent());
+app.get('/threads', proxyToAgent());
+app.get('/threads/:threadId', proxyToAgent());
+app.get('/stats', proxyToAgent());
+app.post('/threads/:threadId/ask', validateBody(AskBody), proxyAskStream());
+// Phase 4 C6: both bodyless (GET has none, DELETE's generic forwarder sets hasBody=false
+// for DELETE — proxy.ts:25), so the generic proxyToAgent() needs no streaming/validation
+// wrapper here, same as /threads/:threadId above.
+app.get('/memory', proxyToAgent());
+app.delete('/memory/:memoryId', proxyToAgent());
+// Phase 5 C4. Only the upload needs special handling (multipart, D3); the other three are
+// ordinary JSON/bodyless routes the generic forwarder already covers.
+app.post('/spaces', validateBody(CreateSpaceBody), proxyToAgent());
+app.get('/spaces', proxyToAgent());
+app.post('/spaces/:spaceId/documents', proxyUpload());
+app.get('/spaces/:spaceId/documents', proxyToAgent());
+
 // ---------------------------------------------------------------- everything else: 501
 
 /**
@@ -97,8 +169,23 @@ const notImplemented = (route: string) => (_req: express.Request, res: express.R
   });
 };
 
+const BUILT_ROUTES = new Set([
+  'POST /threads',
+  'GET /threads',
+  'GET /threads/:threadId',
+  'GET /stats',
+  'POST /threads/:threadId/ask',
+  'GET /memory',
+  'DELETE /memory/:memoryId',
+  'POST /spaces',
+  'GET /spaces',
+  'POST /spaces/:spaceId/documents',
+  'GET /spaces/:spaceId/documents'
+]);
+
 for (const route of ROUTES) {
   if (route.path === '/health') continue;
+  if (BUILT_ROUTES.has(`${route.method} ${route.path}`)) continue;
   const path = route.path.replace(/:(\w+)/g, ':$1');
   const method = route.method.toLowerCase() as 'get' | 'post' | 'delete';
   app[method](path, notImplemented(`${route.method} ${route.path}`));
@@ -118,10 +205,24 @@ app.use((req, res) => {
   res.status(404).json({ error: `no route ${req.method} ${req.path}`, status: 404 });
 });
 
-// A thrown error is a 502 with a log line, never a 200 with a plausible body (rule A1).
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  log.error({ err, requestId: res.locals.requestId }, 'gateway error');
-  res.status(502).json({ error: err.message, status: 502, requestId: String(res.locals.requestId) });
+/**
+ * BUG-007: `express.json` throws a `SyntaxError` carrying `status: 400` on malformed JSON
+ * (and a body over the 1mb limit with `status: 413`), but mapping every `Error` straight
+ * to `502` — a status the contract reserves for upstream provider failure — turned a
+ * client mistake into a lie about the agent being down. Honour a thrown error's own
+ * 4xx `status`/`statusCode`; fall through to `502` only for a genuinely unknown error
+ * (rule A1: still never a `200` with a plausible body).
+ */
+app.use((err: Error & { status?: number; statusCode?: number; type?: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const requestId = String(res.locals.requestId);
+  const status = err.status ?? err.statusCode;
+  if (status !== undefined && status >= 400 && status < 500) {
+    const message = err.type === 'entity.too.large' ? 'request body too large' : err.message;
+    res.status(status).json({ error: message, status, requestId });
+    return;
+  }
+  log.error({ err, requestId }, 'gateway error');
+  res.status(502).json({ error: err.message, status: 502, requestId });
 });
 
 app.listen(env.port, () => {
